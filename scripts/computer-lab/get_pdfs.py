@@ -1,15 +1,29 @@
 import argparse
+import os
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Set
+from typing import Callable, Iterable, Optional, Set, Tuple, List
 from urllib.parse import urlparse
 
+from funcy import partial
+from maya import MayaDT, parse, now
 import requests
-from requests_html import HTMLSession
+from requests_html import HTMLSession, HTMLResponse
+
+Time = MayaDT
+time_from_epoch = MayaDT  # pylint: disable=invalid-name
+time_from_header = parse  # pylint: disable=invalid-name
 
 
-def subsite(url: str, toplevel: str) -> bool:
-    return url.startswith(toplevel) and\
-        (url.endswith("/") or url.endswith(".html"))
+CHUNK_SIZE = 16 * 1024
+
+
+def epoch(time: Time) -> float:
+    return time.datetime().timestamp()
+
+
+def subsite(toplevel: str, url: str) -> bool:
+    return (url.startswith(toplevel)
+            and (url.endswith("/") or url.endswith(".html")))
 
 
 def get_links(url: str, element: str = 'html',
@@ -19,12 +33,9 @@ def get_links(url: str, element: str = 'html',
               visited: Set[str] = set(), depth: int = 10) -> Set[str]:
     if depth < 0:
         return set()
-    if not recurse_filter:
-        recurse_filter = lambda link: subsite(link, url)  # noqa: E731
+    recurse_filter = recurse_filter or partial(subsite, url)
     if not visited:
         visited.add(url)
-
-    print("Visiting page {}".format(url))
 
     response = session.get(url)
     # pylint: disable=no-member
@@ -57,32 +68,52 @@ def corresponding_relpath(url):
 
 
 def save_files(urls: Iterable[str], parent: Path = Path('.'),
-               session: HTMLSession = HTMLSession()) -> None:
+               session: HTMLSession = HTMLSession())\
+               -> Tuple[List[HTMLResponse], List[Tuple[str, Time, Time]]]:
+    errors, already_present = [], []
     for url in urls:
-        # TODO: implement last-modified date checking
-        # before downloading a new file
-        response = session.get(url)
+        response = session.get(url, stream=True)
         # pylint: disable=no-member
-        if not response.status_code == requests.codes.ok:
-            print("Received status code {} for site {}"
-                  .format(response.status_code, url))
-            response.raise_for_status()
+        if response.status_code != requests.codes.ok:
+            errors.append(response)
+            continue
         # TODO: [difficult] implement raven authentication
 
         path = parent.joinpath(corresponding_relpath(url))
         if not path.parent.exists():
             path.parent.mkdir(parents=True)
-        path.write_bytes(response.content)
+        remote_time = time_from_header(response.headers['Last-Modified'])
+        if path.is_file():
+            file_time = time_from_epoch(path.stat().st_mtime)
+            if file_time >= remote_time:
+                already_present.append((url, remote_time, file_time))
+                continue
+
+        with path.open('wb') as fout:
+            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                if chunk:
+                    fout.write(chunk)
+        os.utime(path, times=(epoch(now()), epoch(remote_time)))
+    return errors, already_present
+
+
+def interactive():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('site', type=str,
+                        help='website to download files from')
+    parser.add_argument('-r', '--rootdir', default=Path('.'), type=Path,
+                        help='root dir to save files to')
+    args = parser.parse_args()
+
+    links = get_links(args.site, '#content', lambda x: x.endswith(".pdf"))
+    errors, already_present = save_files(links, args.rootdir)
+    print(f"Downloaded {len(links) - len(errors) - len(already_present)} "
+          f"out of {len(links)} pdfs to {args.rootdir} "
+          f"({len(already_present)} were already present)")
+    print(f"There were {len(errors)} errors:")
+    for error in errors:
+        print(f"{error.url}: {error.status_code} [{error.reason}]")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()  # pylint: disable=invalid-name
-    parser.add_argument('site', type=str,
-                        help='website to download files from')
-    parser.add_argument('--rootdir', default=Path('.'), type=Path,
-                        help='root dir to save files to')
-    args = parser.parse_args()  # pylint: disable=invalid-name
-
-    LINKS = get_links(args.site, '#content', lambda x: x.endswith(".pdf"))
-    save_files(LINKS, args.rootdir)
-    print("Downloaded {} pdfs to {}".format(len(LINKS), args.rootdir))
+    interactive()
