@@ -1,10 +1,10 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Set, Tuple, List
+from typing import Callable, Optional, Set, Tuple, List, Mapping, Union
 from urllib.parse import urlparse
 
-from funcy import partial
+from funcy import partial, rpartial, all_fn
 from maya import MayaDT, parse, now
 import requests
 from requests_html import HTMLSession, HTMLResponse
@@ -30,8 +30,10 @@ def get_links(url: str, element: str = 'html',
               selection_filter: Callable[[str], bool] = lambda _: True,
               recurse_filter: Optional[Callable[[str], bool]] = None,
               session: HTMLSession = HTMLSession(),
-              visited: Set[str] = set(), depth: int = 10) -> Set[str]:
+              visited: Set[str] = set(), depth: int = 20)\
+              -> Mapping[str, Set[str]]:
     if depth < 0:
+        print(f"Reached maximum depth in {url}")
         return set()
     recurse_filter = recurse_filter or partial(subsite, url)
     if not visited:
@@ -40,16 +42,15 @@ def get_links(url: str, element: str = 'html',
     response = session.get(url)
     # pylint: disable=no-member
     if not response.status_code == requests.codes.ok:
-        print("Received status code {} for site {}"
-              .format(response.status_code, url))
-        response.raise_for_status()
+        return {}
+        # response.raise_for_status()
     # TODO: [difficult] implement raven authentication
 
     new_links: Set[str] = set()
-    collected: Set[str] = set()
+    collected: Mapping[str, Set[str]] = {}
     for elem in response.html.find(element):
         new_links.update(filter(recurse_filter, elem.absolute_links))
-        collected.update(filter(selection_filter, elem.absolute_links))
+        collected[url] = set(filter(selection_filter, elem.absolute_links))
     new_links.difference_update(visited)
 
     visited.update(new_links)
@@ -67,52 +68,101 @@ def corresponding_relpath(url):
     return Path(url.netloc).joinpath(relpath)
 
 
-def save_files(urls: Iterable[str], parent: Path = Path('.'),
+def save_files(url_groups: Mapping[str, Set[str]], parent: Path = Path('.'),
                session: HTMLSession = HTMLSession())\
-               -> Tuple[List[HTMLResponse], List[Tuple[str, Time, Time]]]:
-    errors, already_present = [], []
-    for url in urls:
-        response = session.get(url, stream=True)
-        # pylint: disable=no-member
-        if response.status_code != requests.codes.ok:
-            errors.append(response)
-            continue
-        # TODO: [difficult] implement raven authentication
-
-        path = parent.joinpath(corresponding_relpath(url))
-        if not path.parent.exists():
-            path.parent.mkdir(parents=True)
-        remote_time = time_from_header(response.headers['Last-Modified'])
-        if path.is_file():
-            file_time = time_from_epoch(path.stat().st_mtime)
-            if file_time >= remote_time:
-                already_present.append((url, remote_time, file_time))
-                continue
-
-        with path.open('wb') as fout:
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:
-                    fout.write(chunk)
-        os.utime(path, times=(epoch(now()), epoch(remote_time)))
-    return errors, already_present
+               -> Tuple[List[HTMLResponse],
+                        List[HTMLResponse],
+                        List[Tuple[str, Time, Time]]]:
+    logs = ([], [], [])
+    for source, urls in url_groups.items():
+        for url in urls:
+            try:
+                i, log = save_file(url, parent, session)
+                if i != OK:
+                    logs[i].append(log)
+            except Exception as err:
+                print(f"Exception occured for url {url} from {source}:\n"
+                      f"{err}")
+    return logs
 
 
+# TODO: extract to enum
+OK, ERROR, NON_PDF, PRESENT = -1, 0, 1, 2
+
+
+def save_file(url: str, parent: Path, session: HTMLSession)\
+        -> Tuple[int, Union[HTMLResponse, Tuple[str, Time, Time], None]]:
+    response = session.get(url, stream=True)
+    # pylint: disable=no-member
+    if response.status_code != requests.codes.ok:
+        return ERROR, response
+    # TODO: [difficult] implement raven authentication
+    if response.headers['Content-Type'] != 'application/pdf':
+        return NON_PDF, response
+    path = parent.joinpath(corresponding_relpath(url))
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True)
+    remote_time = time_from_header(response.headers['Last-Modified'])
+    if path.is_file():
+        file_time = time_from_epoch(path.stat().st_mtime)
+        if file_time >= remote_time:
+            return PRESENT, (url, remote_time, file_time)
+
+    with path.open('wb') as fout:
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            if chunk:
+                fout.write(chunk)
+    os.utime(path, times=(epoch(now()), epoch(remote_time)))
+    return OK, None
+
+
+# TODO: implement html source download
 def interactive():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('site', type=str,
                         help='website to download files from')
-    parser.add_argument('-r', '--rootdir', default=Path('.'), type=Path,
-                        help='root dir to save files to')
+    parser.add_argument('-d', '--dir', default=Path('.'), type=Path,
+                        help='directory to save files in')
+    parser.add_argument('-r', '--root', default=None, type=str,
+                        help='url of the toplevel which should not be left')
+    parser.add_argument('-i', '--ignore_root', action='store_true',
+                        help=('ignore toplevel when deciding '
+                              'whether to download a particular pdf '
+                              '(toplevel only used for recursive walk)'))
+    parser.add_argument('-m', '--max_depth', default=20, type=int,
+                        help='maximum number of links to follow')
     args = parser.parse_args()
 
-    links = get_links(args.site, '#content', lambda x: x.endswith(".pdf"))
-    errors, already_present = save_files(links, args.rootdir)
-    print(f"Downloaded {len(links) - len(errors) - len(already_present)} "
-          f"out of {len(links)} pdfs to {args.rootdir} "
+    selection_filter = rpartial(str.endswith, ".pdf")
+    if args.root:
+        selection_filter = all_fn(selection_filter,
+                                  rpartial(str.startswith, args.root))
+
+    links = get_links(args.site,
+                      element='#content',
+                      selection_filter=selection_filter,
+                      recurse_filter=partial(subsite, args.root or args.site),
+                      depth=args.max_depth)
+    logs = errors, non_pdfs, already_present = save_files(links, args.dir)
+    num_links = sum(map(len, links.values()))
+    print(f"Downloaded {num_links - sum(map(len, logs))} "
+          f"out of {num_links} pdfs to {args.dir} "
           f"({len(already_present)} were already present)")
-    print(f"There were {len(errors)} errors:")
-    for error in errors:
-        print(f"{error.url}: {error.status_code} [{error.reason}]")
+    print()
+    if non_pdfs:
+        print(f"There were {len(non_pdfs)} non-pdf responses:")
+        for response in non_pdfs:
+            print(f"{response.url}: {response.headers['Content-Type']}")
+    else:
+        print("There were no non-pdf responses.")
+    print()
+    if errors:
+        print(f"There were {len(errors)} errors:")
+        for error in errors:
+            print(f"{error.url}: {error.status_code} [{error.reason}]")
+    else:
+        print("There were no errors.")
 
 
 if __name__ == '__main__':
