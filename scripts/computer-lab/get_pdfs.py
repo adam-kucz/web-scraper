@@ -1,10 +1,11 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Callable, Optional, Set, Tuple, List, Mapping, Union
-from urllib.parse import urlparse
+from typing import (Callable, Optional, Set, Tuple,
+                    List, Mapping, Union, TypeVar)
+from urllib.parse import urlparse, ParseResult as URL
 
-from funcy import partial, rpartial, all_fn
+from funcy import partial, rpartial, all_fn, post_processing
 from maya import MayaDT, parse, now
 import requests
 from requests_html import HTMLSession, HTMLResponse
@@ -17,21 +18,36 @@ time_from_header = parse  # pylint: disable=invalid-name
 CHUNK_SIZE = 16 * 1024
 
 
+A = TypeVar('A')
+B = TypeVar('B')
+
+
+def bind(ma: Optional[A], f: Callable[[A], Optional[B]]) -> Optional[B]:
+    return f(ma) if ma else None
+
+
+@post_processing(all)
+def urlstartswith(url: URL, parent: URL):
+    yield url.netloc == parent.netloc
+    yield url.path.startswith(parent.path)
+
+
 def epoch(time: Time) -> float:
     return time.datetime().timestamp()
 
 
-def subsite(toplevel: str, url: str) -> bool:
-    return (url.startswith(toplevel)
-            and (url.endswith("/") or url.endswith(".html")))
+def subsite(toplevel: URL, url: URL) -> bool:
+    return (urlstartswith(url, toplevel)
+            and (url.path.endswith("/") or url.path.endswith(".html")))
 
 
-def get_links(url: str, element: str = 'html',
+def get_links(url: URL, element: str = 'html',
               selection_filter: Callable[[str], bool] = lambda _: True,
               recurse_filter: Optional[Callable[[str], bool]] = None,
               session: HTMLSession = HTMLSession(),
-              visited: Set[str] = set(), depth: int = 20)\
+              visited: Optional[Set[URL]] = None, depth: int = 20)\
               -> Mapping[str, Set[str]]:
+    visited = visited or set()
     if depth < 0:
         print(f"Reached maximum depth in {url}")
         return set()
@@ -39,18 +55,20 @@ def get_links(url: str, element: str = 'html',
     if not visited:
         visited.add(url)
 
-    response = session.get(url)
+    response = session.get(url.geturl())
     # pylint: disable=no-member
     if not response.status_code == requests.codes.ok:
         return {}
         # response.raise_for_status()
     # TODO: [difficult] implement raven authentication
 
-    new_links: Set[str] = set()
-    collected: Mapping[str, Set[str]] = {}
+    new_links: Set[URL] = set()
+    collected: Mapping[URL, Set[URL]] = {}
     for elem in response.html.find(element):
-        new_links.update(filter(recurse_filter, elem.absolute_links))
-        collected[url] = set(filter(selection_filter, elem.absolute_links))
+        new_links.update(filter(recurse_filter,
+                                map(urlparse, elem.absolute_links)))
+        collected[url] = set(filter(selection_filter,
+                                    map(urlparse, elem.absolute_links)))
     new_links.difference_update(visited)
 
     visited.update(new_links)
@@ -61,8 +79,7 @@ def get_links(url: str, element: str = 'html',
     return collected
 
 
-def corresponding_relpath(url):
-    url = urlparse(url)
+def corresponding_relpath(url: URL):
     path = Path(url.path)
     relpath = path.relative_to(path.anchor)
     return Path(url.netloc).joinpath(relpath)
@@ -90,9 +107,9 @@ def save_files(url_groups: Mapping[str, Set[str]], parent: Path = Path('.'),
 OK, ERROR, NON_PDF, PRESENT = -1, 0, 1, 2
 
 
-def save_file(url: str, parent: Path, session: HTMLSession)\
+def save_file(url: URL, parent: Path, session: HTMLSession)\
         -> Tuple[int, Union[HTMLResponse, Tuple[str, Time, Time], None]]:
-    response = session.get(url, stream=True)
+    response = session.get(url.geturl())  # , stream=True)
     # pylint: disable=no-member
     if response.status_code != requests.codes.ok:
         return ERROR, response
@@ -124,25 +141,32 @@ def interactive():
                         help='website to download files from')
     parser.add_argument('-d', '--dir', default=Path('.'), type=Path,
                         help='directory to save files in')
-    parser.add_argument('-r', '--root', default=None, type=str,
-                        help='url of the toplevel which should not be left')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-r', '--root', default=None, type=str,
+                       help='url of the toplevel which should not be left')
+    group.add_argument('-l', '--local', action='store_true',
+                       help='alternative to root, sets root to value of site')
     parser.add_argument('-i', '--ignore_root', action='store_true',
                         help=('ignore toplevel when deciding '
                               'whether to download a particular pdf '
                               '(toplevel only used for recursive walk)'))
+    parser.add_argument('-e', '--element', default="#content", type=str,
+                        help='maximum number of links to follow')
     parser.add_argument('-m', '--max_depth', default=20, type=int,
                         help='maximum number of links to follow')
     args = parser.parse_args()
 
-    selection_filter = rpartial(str.endswith, ".pdf")
-    if args.root:
+    selection_filter = (lambda url: url.path.endswith(".pdf"))
+    root = bind(args.root if not args.local else args.site, urlparse)
+    if root and not args.ignore_root:
         selection_filter = all_fn(selection_filter,
-                                  rpartial(str.startswith, args.root))
+                                  rpartial(urlstartswith, root))
 
-    links = get_links(args.site,
-                      element='#content',
+    links = get_links(urlparse(args.site),
+                      element=args.element,
                       selection_filter=selection_filter,
-                      recurse_filter=partial(subsite, args.root or args.site),
+                      recurse_filter=(partial(subsite, root) if root
+                                      else (lambda _: True)),
                       depth=args.max_depth)
     logs = errors, non_pdfs, already_present = save_files(links, args.dir)
     num_links = sum(map(len, links.values()))
