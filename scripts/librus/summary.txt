@@ -1,6 +1,7 @@
+lesson summary
 Adam Kucz
-23-09-01
-23-09-22
+2023-09-01
+2023-09-22
 2a,informatyka
 3e,Mathematics applications and interpretation
 3e,COMP HL/SL

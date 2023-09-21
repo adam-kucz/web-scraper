@@ -1,5 +1,6 @@
 import pickle
 import time
+from datetime import date, timedelta
 from io import StringIO
 
 import matplotlib.pyplot as plt
@@ -9,7 +10,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from scripts.librus.urls import HEADERS, API_URL, LESSONS_DONE_URL
+from scripts.librus.urls import HEADERS, API_URL, LESSONS_DONE_URL, LESSON_PLAN_URL
 
 classes = {
     "2a": "81845",
@@ -31,7 +32,7 @@ LOGIN_PAYLOAD = {
     "pass": ":L^}<w.H5Ui;[yg=Q\\&KXF!6rJsx)Ah\"f>P,}.zs4%\\+h?U^0",
     "action": "login"
 }
-LESSON_PAYLOAD = {
+LESSON_SUMMARY_PAYLOAD = {
     "requestkey": "", # from "value" parameter of input with name "requestkey"
     "tryb_pelnoekranowy": "0",
     "data_od": "", # format: "{year:4}-{month:2}-{day:2}",
@@ -46,6 +47,17 @@ LESSON_PAYLOAD = {
     "filtrowanie_pojemnik": "1001",
     "filtruj": "Filtruj",
     "reczny_submit": "1"
+}
+LESSON_PLAN_PAYLOAD = {
+    "requestkey": "", # from "value" parameter of input with name "requestkey"
+    "rodzajPlanu": "1",
+    "nauczyciel": "",
+    "typWyswietlaniaPlanu": "1",
+    "tydzien": "",  # format: "{year:4}-{month:2}-{day:2}_{year:4}-{month:2}-{day:2}", start_end, Mon_Sun
+    "pokaz_zajecia_op": "on",
+    "pokaz_zajecia_dzd": "on",
+    "pokaz_zajecia_zsk": "on",
+    #    "pokaz_zajecia_ni": "on",
 }
 
 headers = {
@@ -71,7 +83,7 @@ def authenticate_browser(session):
     session.get(f"{API_URL}/OAuth/Authorization/PerformLogin?client_id=47")
 
 
-def get_dataframe(html):
+def get_summary_dataframe(html):
     html_tables = pd.read_html(StringIO(html))
     df = html_tables[1]
     df = df.drop(columns=["Klasa", "Data.1", "Nr lekcji", "Zajęcie Edukacyjne", "Podstawa programowa", "licz...", "RPN", "Operacje"])
@@ -79,7 +91,15 @@ def get_dataframe(html):
     return df.dropna(axis=0, how="all").sort_values("Data")
 
 
-def save_as_pdf(dataframe, filename, figsize=(21/2.54, 29.7/2.54)): # TODO: fix figure and font sizing
+def get_week_plan_dataframe(html):
+    html_tables = pd.read_html(StringIO(html))
+    df = html_tables[1]
+    df = df.drop(columns=["Godziny"])
+    df = df[["Data", "ob", "nb", "Temat zajęć edukacyjnych"]]
+    return df.dropna(axis=0, how="all").sort_values("Data")
+
+
+def save_summary_as_pdf(dataframe, filename, figsize=(21 / 2.54, 29.7 / 2.54)): # TODO: fix figure and font sizing
     dataframe = dataframe.astype({"ob": np.int8, "nb": np.int8})
     fig, ax = plt.subplots(figsize=figsize)
     ax.axis('tight')
@@ -95,6 +115,10 @@ def save_as_pdf(dataframe, filename, figsize=(21/2.54, 29.7/2.54)): # TODO: fix 
         pp.savefig(fig, bbox_inches='tight', orientation="portrait")
 
 
+def save_full_as_pdf(dataframes, filename, figsize=(21 / 2.54, 29.7 / 2.54)):
+    pass
+
+
 def get_one_from(name, mapping):
     keys = list(mapping)
     print(f"Choose {name}, known are:")
@@ -103,7 +127,11 @@ def get_one_from(name, mapping):
     return mapping[keys[int(input("Choice: "))]]
 
 
-def interactive(session, filters):
+def interactive(session):
+    filters = LESSON_SUMMARY_PAYLOAD.copy()
+    lessons_done_response = session.get(LESSONS_DONE_URL)
+    soup = BeautifulSoup(lessons_done_response.text, "lxml")
+    filters['request_key'] = soup.find("input", {'name': 'requestkey'}).get('value')
     filters['data_od'] = "20" + input("Give date to start at, in the YY-MM-DD format: ")
     filters['data_do'] = "20" + input("Give date to end at, in the YY-MM-DD format: ")
     filters['filtruj_id_nauczyciela'] = get_one_from("teacher", teachers)
@@ -113,31 +141,63 @@ def interactive(session, filters):
         filters["filtruj_id_klasy"] = classes[class_]
         filters['filtruj_id_przedmiotu'] = get_one_from("subject", subjects)
         filter_response = session.post(LESSONS_DONE_URL, data=filters)
-        open("filter_response.html", "w", encoding="utf-8").write(filter_response.text)
-        dataframe = get_dataframe(filter_response.text)
+        dataframe = get_summary_dataframe(filter_response.text)
         filename = input("Filename to save data as: ")
-        save_as_pdf(dataframe, filename)
+        save_summary_as_pdf(dataframe, filename)
         next_filter = input("Continue? Leave blank to finish.")
 
 
-def from_data(session, filters, filename):
+def from_data(session, filename):
     with open(filename, "r", encoding="utf-8") as datafile:
         lines = datafile.readlines()
-        teacher = lines[0][:-1]
-        date_from = lines[1][:-1]
-        date_to = lines[2][:-1]
-        filters['filtruj_id_nauczyciela'] = teachers[teacher]
-        filters['data_od'] = "20" + date_from
-        filters['data_do'] = "20" + date_to
-        for line in lines[3:]:
-            class_, subject = line[:-1].split(",")
-            filters["filtruj_id_klasy"] = classes[class_]
-            filters['filtruj_id_przedmiotu'] = subjects[subject]
-            filter_response = session.post(LESSONS_DONE_URL, data=filters)
-            open("filter_response.html", "w", encoding="utf-8").write(filter_response.text)
-            dataframe = get_dataframe(filter_response.text)
-            filename = " ".join((date_from, "to", date_to, teacher, class_, subject)).replace("/", " and ")
-            save_as_pdf(dataframe, filename)
+    filetype = lines[0][:-1]
+    if filetype == "lesson summary":
+        lesson_summary_from_data(session, lines[1:])
+    elif filetype == "full plan":
+        full_plan_from_data(session, lines)
+
+
+def full_plan_from_data(session, lines):
+    dataframes = []
+
+    filters = LESSON_PLAN_PAYLOAD.copy()
+    lessons_done_response = session.get(LESSON_PLAN_URL)
+    soup = BeautifulSoup(lessons_done_response.text, "lxml")
+    filters['request_key'] = soup.find("input", {'name': 'requestkey'}).get('value')
+    teacher = lines[0][:-1]
+    date_from = date.fromisoformat(lines[1][:-1])
+    original_date_from = date_from
+    date_to = date.fromisoformat(lines[2][:-1])
+    filters['nauczyciel'] = teachers[teacher]
+    while date_from < date_to:
+        filters['tydzien'] = f"{date_from}_{date_from + timedelta(days=6)}"
+        response = session.post(LESSONS_DONE_URL, data=filters)
+        dataframes.append(get_week_plan_dataframe(response.text))
+        date_from += timedelta(days=6)
+    filename = " ".join((original_date_from, "to", date_to, teacher))
+    save_full_as_pdf(dataframes, filename)
+
+
+def lesson_summary_from_data(session, lines):
+    filters = LESSON_SUMMARY_PAYLOAD.copy()
+    lessons_done_response = session.get(LESSONS_DONE_URL)
+    soup = BeautifulSoup(lessons_done_response.text, "lxml")
+    filters['request_key'] = soup.find("input", {'name': 'requestkey'}).get('value')
+    teacher = lines[0][:-1]
+    date_from = lines[1][:-1]
+    date_to = lines[2][:-1]
+    filters['filtruj_id_nauczyciela'] = teachers[teacher]
+    filters['data_od'] = date_from
+    filters['data_do'] = date_to
+    for line in lines[3:]:
+        class_, subject = line[:-1].split(",")
+        filters["filtruj_id_klasy"] = classes[class_]
+        filters['filtruj_id_przedmiotu'] = subjects[subject]
+        filter_response = session.post(LESSONS_DONE_URL, data=filters)
+        dataframe = get_summary_dataframe(filter_response.text)
+        filename = " ".join((date_from, "to", date_to, teacher, class_, subject)).replace("/", " and ")
+        save_summary_as_pdf(dataframe, filename)
+    print("Remember to add lessons that were skipped and are not in Librus!")
 
 
 def main():
@@ -152,15 +212,11 @@ def main():
             login(s)
 
         time.sleep(2)
-        filters = LESSON_PAYLOAD.copy()
-        lessons_done_response = s.get(LESSONS_DONE_URL)
-        soup = BeautifulSoup(lessons_done_response.text, "lxml")
-        filters['request_key'] = soup.find("input", {'name': 'requestkey'}).get('value')
         data = input("Give filename of file with data to download (empty for interactive): ")
         if not data:
-            interactive(s, filters)
+            interactive(s)
         else:
-            from_data(s, filters, data)
+            from_data(s, data)
 
         fileout = input("Save cookies in file (empty to not save): ")
         if fileout:
